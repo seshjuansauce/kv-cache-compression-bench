@@ -29,6 +29,8 @@ For long inputs, how do **H2O-style KV-cache eviction** (dropping tokens) and **
 
 Two equal-memory pairs (`h2o_75` vs `kv_int4`, and `kv_int2` vs `h2o_50+kv_int4`) answer the headline question: at the same budget, drop tokens or lower precision?
 
+**KV quantisation backend:** transformers' `QuantizedCache` with **HQQ** (`--kv-backend hqq`, the default). The quanto backend's CUDA kernels fail to compile on a T4; use `--kv-backend quanto` only on Ampere or newer GPUs.
+
 **Measured per answer:** score (RULER exact-answer match), latency, GPU energy (NVML), peak GPU memory and calculated KV-cache size.
 
 ## Run on Kaggle

@@ -10,7 +10,7 @@ Conditions (all on the same model, eager attention, fp16):
   full_fp16        full KV cache, no compression (baseline)
   h2o_50           drop 50% of context KV pairs by observed attention (H2O-style)
   h2o_75           drop 75%
-  kv_int4          keep every token, store the KV cache in 4-bit (quanto)
+  kv_int4          keep every token, store the KV cache in 4-bit (HQQ by default)
   kv_int2          keep every token, store the KV cache in 2-bit
   h2o_50+kv_int4   drop 50%, store the rest in 4-bit
 
@@ -24,7 +24,7 @@ and an analytic KV-cache size for the context.
 
 Runs on one NVIDIA GPU. A free Kaggle or Colab T4 is enough.
 
-  pip install -q kvpress optimum-quanto nvidia-ml-py datasets pandas matplotlib
+  pip install -q kvpress hqq optimum-quanto nvidia-ml-py datasets pandas matplotlib
   python kv_eviction_vs_quant.py --n 25
   python kv_eviction_vs_quant.py --summarise   # tables + plot from results.csv
 
@@ -138,23 +138,29 @@ def load_model(name):
     return model, tok
 
 
-def make_cache(nbits, config=None):
+def make_cache(nbits, config=None, backend="hqq"):
     """A fresh quantised KV cache, or None for the default full-precision cache.
-    Tries the newest transformers API first, then older ones."""
+    backend: "hqq" (pure PyTorch, works on a T4) or "quanto" (its CUDA kernels do not
+    compile on a T4; use it on Ampere or newer GPUs).
+    Picks the constructor by inspecting the installed transformers version, so a real
+    error inside the cache is shown instead of being hidden by a fallback."""
     if nbits is None:
         return None
-    from transformers import QuantizedCache
+    import inspect
 
-    attempts = [
-        lambda: QuantizedCache(backend="quanto", config=config, nbits=nbits),  # newest: needs the model config
-        lambda: QuantizedCache(backend="quanto", nbits=nbits),                 # transformers ~4.56
-    ]
-    for build in attempts:
-        try:
-            return build()
-        except TypeError:
-            continue
-    from transformers import QuantizedCacheConfig, QuantoQuantizedCache       # older transformers
+    import transformers
+
+    QuantizedCache = getattr(transformers, "QuantizedCache", None)
+    params = inspect.signature(QuantizedCache.__init__).parameters if QuantizedCache else {}
+    if "config" in params:   # newest transformers: needs the model config
+        return QuantizedCache(backend=backend, config=config, nbits=nbits)
+    if "backend" in params:  # transformers ~4.56
+        return QuantizedCache(backend=backend, nbits=nbits)
+    from transformers import QuantizedCacheConfig  # older transformers
+    if backend == "hqq":
+        from transformers import HQQQuantizedCache
+        return HQQQuantizedCache(cache_config=QuantizedCacheConfig(backend="HQQ", nbits=nbits))
+    from transformers import QuantoQuantizedCache
     return QuantoQuantizedCache(cache_config=QuantizedCacheConfig(nbits=nbits))
 
 
@@ -237,14 +243,17 @@ def run(args):
         try:
             w = todo.iloc[0]
             pipe(w["context"], question=w["question"], answer_prefix=w["answer_prefix"],
-                 press=make_press(spec["ratio"]), cache=make_cache(spec["nbits"], model.config), max_new_tokens=8)
+                 press=make_press(spec["ratio"]), cache=make_cache(spec["nbits"], model.config, args.kv_backend), max_new_tokens=8)
         except Exception as e:
+            import traceback
+
             print(f"[skip] {cond} failed on warm-up: {type(e).__name__}: {e}")
+            traceback.print_exc()
             continue
 
         for _, row in todo.iterrows():
             n_ctx = len(tok(row["context"]).input_ids)
-            press, cache = make_press(spec["ratio"]), make_cache(spec["nbits"], model.config)
+            press, cache = make_press(spec["ratio"]), make_cache(spec["nbits"], model.config, args.kv_backend)
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
             t0 = time.perf_counter()
@@ -258,7 +267,7 @@ def run(args):
             refs = list(row["answer"])
             bits = spec["nbits"] or 16
             rec = dict(
-                condition=cond, row_id=row["row_id"], task=row["task"],
+                condition=cond, row_id=row["row_id"], task=row["task"], kv_backend=args.kv_backend,
                 score=score_example(row["task"], pred, refs),
                 latency_s=round(latency, 3),
                 energy_j=round(meter.joules, 2),
@@ -318,6 +327,8 @@ if __name__ == "__main__":
     p.add_argument("--n", type=int, default=25, help="examples per task")
     p.add_argument("--conditions", nargs="+", choices=list(CONDITIONS))
     p.add_argument("--out", default="results.csv")
+    p.add_argument("--kv-backend", default="hqq", choices=["hqq", "quanto"],
+                   help="KV quantisation backend: hqq works on a T4; quanto needs an Ampere+ GPU")
     p.add_argument("--summarise", action="store_true")
     a = p.parse_args()
     summarise(a) if a.summarise else run(a)

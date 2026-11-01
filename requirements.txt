@@ -1,4 +1,5 @@
 kvpress
+hqq
 optimum-quanto
 nvidia-ml-py
 datasets
