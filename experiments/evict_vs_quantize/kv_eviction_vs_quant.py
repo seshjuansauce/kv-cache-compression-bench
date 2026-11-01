@@ -168,6 +168,7 @@ def kv_bytes_per_token(model):
 def run(args):
     from datasets import load_dataset
     from transformers import pipeline
+    import kvpress  # noqa: F401  importing kvpress registers the "kv-press-text-generation" pipeline
 
     assert torch.cuda.is_available(), "Needs an NVIDIA GPU (Kaggle/Colab T4 is fine)."
 
@@ -241,6 +242,8 @@ def run(args):
 
 # ---------------------------------------------------------------- summary
 def summarise(args):
+    if not os.path.exists(args.out):
+        raise SystemExit(f"{args.out} not found: the run wrote no results. Check the run's output above for the first error.")
     df = pd.read_csv(args.out)
     order = [c for c in CONDITIONS if c in df["condition"].unique()]
 
