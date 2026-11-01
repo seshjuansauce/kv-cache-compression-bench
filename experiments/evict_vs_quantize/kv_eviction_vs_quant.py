@@ -123,18 +123,22 @@ def score_example(task, pred, refs):
 
 
 # ---------------------------------------------------------------- model + caches
-def load_model(name):
+DTYPES = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
+
+
+def load_model(name, dtype="float16"):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     tok = AutoTokenizer.from_pretrained(name)
+    torch_dtype = DTYPES[dtype]
     # Eager attention is required by kvpress's ObservedAttentionPress (H2O-style).
     # It is used for every condition so attention cost is the same everywhere.
-    model = AutoModelForCausalLM.from_pretrained(
-        name, torch_dtype=torch.float16, attn_implementation="eager"
-    )
-    if model.dtype != torch.float16:
-        model = model.half()
-    model = model.to("cuda").eval()
+    try:
+        model = AutoModelForCausalLM.from_pretrained(name, dtype=torch_dtype, attn_implementation="eager")
+    except TypeError:  # older transformers only know torch_dtype
+        model = AutoModelForCausalLM.from_pretrained(name, torch_dtype=torch_dtype, attn_implementation="eager")
+    model = model.to(dtype=torch_dtype, device="cuda").eval()
+    print(f"[model] {name} in {dtype}")
     return model, tok
 
 
@@ -201,12 +205,38 @@ def setup_hf_token():
         pass
     print("[hf] no HF_TOKEN found; downloading without authentication")
 
+
+def patch_kvpress_for_quantized_caches():
+    """kvpress removes the generated answer from a quantised cache by slicing quanto tensors
+    directly, which fails for HQQ (it stores (tensor, metadata) tuples). This script builds a
+    fresh cache for every question and asks one question per call, so that trimming is never
+    needed: skip it for quantised caches, keep kvpress's behaviour for everything else."""
+    import inspect
+
+    from kvpress.pipeline import KVPressTextGenerationPipeline
+    from transformers import QuantizedCache
+
+    name = "_remove_answer_from_cache"
+    raw = inspect.getattr_static(KVPressTextGenerationPipeline, name, None)
+    if raw is None:
+        return
+    is_static = isinstance(raw, staticmethod)
+    original = raw.__func__ if is_static else raw
+
+    def safe_remove(self, cache, *args, **kwargs):
+        if isinstance(cache, QuantizedCache):
+            return None
+        return original(cache, *args, **kwargs) if is_static else original(self, cache, *args, **kwargs)
+
+    setattr(KVPressTextGenerationPipeline, name, safe_remove)
+
 # ---------------------------------------------------------------- run
 def run(args):
     setup_hf_token()  # before any download
     from datasets import load_dataset
     from transformers import pipeline
     import kvpress  # noqa: F401  importing kvpress registers the "kv-press-text-generation" pipeline
+    patch_kvpress_for_quantized_caches()
 
     assert torch.cuda.is_available(), "Needs an NVIDIA GPU (Kaggle/Colab T4 is fine)."
 
@@ -220,7 +250,7 @@ def run(args):
         for t in args.tasks
     ).reset_index(names="row_id")
 
-    model, tok = load_model(args.model)
+    model, tok = load_model(args.model, args.dtype)
     pipe = pipeline("kv-press-text-generation", model=model, tokenizer=tok, device=0)
     per_token = kv_bytes_per_token(model)
     meter = EnergyMeter()
@@ -327,6 +357,8 @@ if __name__ == "__main__":
     p.add_argument("--n", type=int, default=25, help="examples per task")
     p.add_argument("--conditions", nargs="+", choices=list(CONDITIONS))
     p.add_argument("--out", default="results.csv")
+    p.add_argument("--dtype", default="float16", choices=list(DTYPES),
+                   help="Model precision. Try float32 if answers come out as garbage (fp16 overflow)")
     p.add_argument("--kv-backend", default="hqq", choices=["hqq", "quanto"],
                    help="KV quantisation backend: hqq works on a T4; quanto needs an Ampere+ GPU")
     p.add_argument("--summarise", action="store_true")
