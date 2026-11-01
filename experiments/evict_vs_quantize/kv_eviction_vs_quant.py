@@ -6,11 +6,11 @@ NeurIPS 2023) and KV-cache quantisation compare, and do they combine, task by ta
 Costs are measured the way Strubell et al. (ACL 2025) recommend: real latency and
 energy on the GPU, not FLOP estimates.
 
-Conditions (all on the same model, eager attention, fp16):
+Conditions (all on the same model, precision and eager attention):
   full_fp16        full KV cache, no compression (baseline)
   h2o_50           drop 50% of context KV pairs by observed attention (H2O-style)
   h2o_75           drop 75%
-  kv_int4          keep every token, store the KV cache in 4-bit (HQQ by default)
+  kv_int4          keep every token, store the KV cache in 4-bit (KIVI-style, the default)
   kv_int2          keep every token, store the KV cache in 2-bit
   h2o_50+kv_int4   drop 50%, store the rest in 4-bit
 
@@ -24,8 +24,8 @@ and an analytic KV-cache size for the context.
 
 Runs on one NVIDIA GPU. A free Kaggle or Colab T4 is enough.
 
-  pip install -q kvpress hqq optimum-quanto nvidia-ml-py datasets pandas matplotlib
-  python kv_eviction_vs_quant.py --n 25
+  pip install -r ../../requirements.txt
+  python kv_eviction_vs_quant.py --n 25 --dtype float32
   python kv_eviction_vs_quant.py --summarise   # tables + plot from results.csv
 
 Results are appended to results.csv after every example, so a dropped session
@@ -40,6 +40,7 @@ import time
 import pandas as pd
 import torch
 import warnings
+from transformers.cache_utils import Cache, QuantizedCache, QuantizedLayer
 
 # One question at a time is deliberate (clean per-answer latency and energy), so silence
 # transformers' hint to batch pipeline calls through a dataset.
@@ -54,6 +55,7 @@ CONDITIONS = {
     "h2o_50+kv_int4": dict(ratio=0.5, nbits=4),
 }
 DEFAULT_TASKS = ["niah_single_1", "vt", "qa_1"]
+KV_GROUP = 64  # quantisation group size; each group stores an fp16 scale and offset
 
 
 # ---------------------------------------------------------------- energy
@@ -142,14 +144,66 @@ def load_model(name, dtype="float16"):
     return model, tok
 
 
-def make_cache(nbits, config=None, backend="hqq"):
+# ---------------------------------------------------------------- KIVI-style KV quantisation
+class KIVILayer(QuantizedLayer):
+    """Asymmetric round-to-nearest KV quantisation laid out as in KIVI (Liu et al., ICML 2024).
+
+    Keys are grouped per channel over KV_GROUP consecutive tokens, because a few key channels
+    are far larger than the rest (Qwen2.5's key bias makes this extreme). Values are grouped
+    per token over KV_GROUP channels. The newest `residual_length` tokens stay in full
+    precision, as in transformers' QuantizedCache.
+
+    Why not transformers' HQQ backend: it flattens the whole (B, H, T, D) tensor before
+    grouping, so once T is not a multiple of 128 the groups mix channels, and Qwen's outlier
+    channels erase the rest. RULER contexts are about 3,600 tokens, so that broke every run.
+
+    Codes are kept as uint8 rather than bit-packed: accuracy matches a real n-bit cache, and
+    memory is reported analytically (kv_ctx_mb), not measured."""
+
+    def __init__(self, nbits=4, group=KV_GROUP, residual_length=128):
+        super().__init__(nbits=nbits, axis_key=0, axis_value=1,
+                         q_group_size=group, residual_length=residual_length)
+
+    def _quantize(self, x, axis):
+        B, H, T, D = x.shape
+        G = self.q_group_size
+        if axis == 0:  # keys: per channel, groups along tokens (pad the last group)
+            pad = (-T) % G
+            if pad:
+                x = torch.cat([x, x[:, :, -1:, :].expand(B, H, pad, D)], dim=2)
+            g, red = x.reshape(B, H, -1, G, D), 3
+        else:          # values: per token, groups along channels
+            G = G if D % G == 0 else D
+            g, red = x.reshape(B, H, T, D // G, G), 4
+        lo = g.amin(red, keepdim=True)
+        scale = (g.amax(red, keepdim=True) - lo).clamp(min=1e-8) / (2 ** self.nbits - 1)
+        q = ((g - lo) / scale).round_().clamp_(0, 2 ** self.nbits - 1).to(torch.uint8)
+        return q, scale, lo, (B, H, T, D)
+
+    def _dequantize(self, packed):
+        q, scale, lo, (B, H, T, D) = packed
+        return (q.to(scale.dtype) * scale + lo).reshape(B, H, -1, D)[:, :, :T]
+
+
+class KIVICache(QuantizedCache):
+    """A QuantizedCache made of KIVILayers, so kvpress treats it like any quantised cache."""
+
+    def __init__(self, config, nbits=4, group=KV_GROUP, residual_length=128):
+        n_layers = config.get_text_config(decoder=True).num_hidden_layers
+        Cache.__init__(self, layers=[KIVILayer(nbits, group, residual_length) for _ in range(n_layers)])
+
+
+def make_cache(nbits, config=None, backend="kivi"):
     """A fresh quantised KV cache, or None for the default full-precision cache.
-    backend: "hqq" (pure PyTorch, works on a T4) or "quanto" (its CUDA kernels do not
-    compile on a T4; use it on Ampere or newer GPUs).
+    backend: "kivi" (default, defined above), or transformers' "hqq" / "quanto" backends,
+    kept for comparison. HQQ mis-groups channels when the length is not a multiple of 128;
+    quanto's CUDA kernels do not compile on a T4.
     Picks the constructor by inspecting the installed transformers version, so a real
     error inside the cache is shown instead of being hidden by a fallback."""
     if nbits is None:
         return None
+    if backend == "kivi":
+        return KIVICache(config, nbits)
     import inspect
 
     import transformers
@@ -208,7 +262,7 @@ def setup_hf_token():
 
 def patch_kvpress_for_quantized_caches():
     """kvpress removes the generated answer from a quantised cache by slicing quanto tensors
-    directly, which fails for HQQ (it stores (tensor, metadata) tuples). This script builds a
+    directly, which fails for HQQ and KIVI caches (both store tuples). This script builds a
     fresh cache for every question and asks one question per call, so that trimming is never
     needed: skip it for quantised caches, keep kvpress's behaviour for everything else."""
     import inspect
@@ -295,7 +349,8 @@ def run(args):
             latency = time.perf_counter() - t0
             pred = out.get("answer") or (out.get("answers") or [""])[0]
             refs = list(row["answer"])
-            bits = spec["nbits"] or 16
+            # 16-bit cache as the reference; quantised caches also pay an fp16 scale and offset per group
+            bits = spec["nbits"] + 32 / KV_GROUP if spec["nbits"] else 16
             rec = dict(
                 condition=cond, row_id=row["row_id"], task=row["task"], kv_backend=args.kv_backend,
                 score=score_example(row["task"], pred, refs),
@@ -304,6 +359,7 @@ def run(args):
                 peak_mem_gb=round(torch.cuda.max_memory_allocated() / 1e9, 3),
                 ctx_tokens=n_ctx,
                 kv_ctx_mb=round(n_ctx * (1 - spec["ratio"]) * per_token * bits / 16 / 1e6, 1),
+                gen_tokens=len(tok(pred, add_special_tokens=False).input_ids),
                 pred=pred[:200].replace("\n", " "), refs="|".join(map(str, refs)),
             )
             pd.DataFrame([rec]).to_csv(args.out, mode="a", header=not os.path.exists(args.out), index=False)
@@ -357,10 +413,12 @@ if __name__ == "__main__":
     p.add_argument("--n", type=int, default=25, help="examples per task")
     p.add_argument("--conditions", nargs="+", choices=list(CONDITIONS))
     p.add_argument("--out", default="results.csv")
-    p.add_argument("--dtype", default="float16", choices=list(DTYPES),
-                   help="Model precision. Try float32 if answers come out as garbage (fp16 overflow)")
-    p.add_argument("--kv-backend", default="hqq", choices=["hqq", "quanto"],
-                   help="KV quantisation backend: hqq works on a T4; quanto needs an Ampere+ GPU")
+    p.add_argument("--dtype", default="float32", choices=list(DTYPES),
+                   help="Model precision. Qwen2.5 overflows in float16 (answers come out as '!!!!'); "
+                        "float32 is safe on a T4, bfloat16 on Ampere or newer")
+    p.add_argument("--kv-backend", default="kivi", choices=["kivi", "hqq", "quanto"],
+                   help="KV quantisation: kivi (default); hqq and quanto are transformers' backends, "
+                        "kept for comparison")
     p.add_argument("--summarise", action="store_true")
     a = p.parse_args()
     summarise(a) if a.summarise else run(a)

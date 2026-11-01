@@ -29,7 +29,9 @@ For long inputs, how do **H2O-style KV-cache eviction** (dropping tokens) and **
 
 Two equal-memory pairs (`h2o_75` vs `kv_int4`, and `kv_int2` vs `h2o_50+kv_int4`) answer the headline question: at the same budget, drop tokens or lower precision?
 
-**KV quantisation backend:** transformers' `QuantizedCache` with **HQQ** (`--kv-backend hqq`, the default). The quanto backend's CUDA kernels fail to compile on a T4; use `--kv-backend quanto` only on Ampere or newer GPUs.
+**KV quantisation:** a KIVI-style cache defined in the script (`--kv-backend kivi`, the default): keys grouped per channel over 64 tokens, values per token over 64 channels, round-to-nearest, newest 128 tokens kept in full precision. transformers' HQQ backend groups the flattened tensor, so once the context length is not a multiple of 128 its groups mix channels and Qwen2.5's outlier key channels wipe out the rest (4-bit outputs were gibberish). quanto's CUDA kernels do not compile on a T4. Both are still selectable for comparison.
+
+**Precision:** the model runs in float32 (`--dtype`, the default). Qwen2.5 overflows in float16 and answers `!!!!`, and a T4 has no native bfloat16. KV sizes are still reported for a 16-bit cache, the standard deployment format, plus 0.5 bit per value for the quantisers' scales and offsets.
 
 **Measured per answer:** score (RULER exact-answer match), latency, GPU energy (NVML), peak GPU memory and calculated KV-cache size.
 
