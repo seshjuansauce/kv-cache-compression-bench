@@ -1,0 +1,6 @@
+kvpress
+optimum-quanto
+nvidia-ml-py
+datasets
+pandas
+matplotlib
