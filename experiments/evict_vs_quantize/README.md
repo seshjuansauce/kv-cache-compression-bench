@@ -35,7 +35,8 @@ Two equal-memory pairs (`h2o_75` vs `kv_int4`, and `kv_int2` vs `h2o_50+kv_int4`
 
 1. Verify your phone number on Kaggle (needed for GPU and internet).
 2. New notebook, then Settings: Accelerator **GPU T4 x2**, Internet **On**.
-3. Run:
+3. Optional but faster: create a **Read** token at huggingface.co (Settings > Access Tokens), then in the notebook open **Add-ons > Secrets**, add it with the label `HF_TOKEN` and attach it to the notebook. The script picks it up automatically; never paste the token into code.
+4. Run:
 
 ```python
 !git clone https://github.com/seshjuansauce/kv-cache-compression-bench.git

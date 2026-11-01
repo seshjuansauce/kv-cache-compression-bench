@@ -39,6 +39,11 @@ import time
 
 import pandas as pd
 import torch
+import warnings
+
+# One question at a time is deliberate (clean per-answer latency and energy), so silence
+# transformers' hint to batch pipeline calls through a dataset.
+warnings.filterwarnings("ignore", message="You seem to be using the pipelines sequentially on GPU")
 
 CONDITIONS = {
     "full_fp16": dict(ratio=0.0, nbits=None),
@@ -164,8 +169,30 @@ def kv_bytes_per_token(model):
     return 2 * n_layers * n_kv * head_dim * 2  # keys + values, fp16 = 2 bytes
 
 
+
+# ---------------------------------------------------------------- Hugging Face token
+def setup_hf_token():
+    """Use HF_TOKEN from the environment, or from Kaggle Secrets when running on Kaggle.
+    The token is never hard-coded or printed. Without it, downloads still work but are
+    unauthenticated (slower and rate-limited)."""
+    if os.environ.get("HF_TOKEN"):
+        print("[hf] using HF_TOKEN from the environment")
+        return
+    try:
+        from kaggle_secrets import UserSecretsClient
+
+        token = UserSecretsClient().get_secret("HF_TOKEN")
+        if token:
+            os.environ["HF_TOKEN"] = token
+            print("[hf] using HF_TOKEN from Kaggle Secrets")
+            return
+    except Exception:
+        pass
+    print("[hf] no HF_TOKEN found; downloading without authentication")
+
 # ---------------------------------------------------------------- run
 def run(args):
+    setup_hf_token()  # before any download
     from datasets import load_dataset
     from transformers import pipeline
     import kvpress  # noqa: F401  importing kvpress registers the "kv-press-text-generation" pipeline

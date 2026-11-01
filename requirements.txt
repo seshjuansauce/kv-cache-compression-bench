@@ -4,3 +4,4 @@ nvidia-ml-py
 datasets
 pandas
 matplotlib
+standard-pipes; python_version >= "3.13"
