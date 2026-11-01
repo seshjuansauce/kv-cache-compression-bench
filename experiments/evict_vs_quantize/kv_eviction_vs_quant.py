@@ -138,19 +138,24 @@ def load_model(name):
     return model, tok
 
 
-def make_cache(nbits):
+def make_cache(nbits, config=None):
     """A fresh quantised KV cache, or None for the default full-precision cache.
-    Handles both the newer and older transformers APIs."""
+    Tries the newest transformers API first, then older ones."""
     if nbits is None:
         return None
-    try:
-        from transformers import QuantizedCache
+    from transformers import QuantizedCache
 
-        return QuantizedCache(backend="quanto", nbits=nbits)
-    except TypeError:
-        from transformers import QuantizedCacheConfig, QuantoQuantizedCache
-
-        return QuantoQuantizedCache(cache_config=QuantizedCacheConfig(nbits=nbits))
+    attempts = [
+        lambda: QuantizedCache(backend="quanto", config=config, nbits=nbits),  # newest: needs the model config
+        lambda: QuantizedCache(backend="quanto", nbits=nbits),                 # transformers ~4.56
+    ]
+    for build in attempts:
+        try:
+            return build()
+        except TypeError:
+            continue
+    from transformers import QuantizedCacheConfig, QuantoQuantizedCache       # older transformers
+    return QuantoQuantizedCache(cache_config=QuantizedCacheConfig(nbits=nbits))
 
 
 def make_press(ratio):
@@ -232,14 +237,14 @@ def run(args):
         try:
             w = todo.iloc[0]
             pipe(w["context"], question=w["question"], answer_prefix=w["answer_prefix"],
-                 press=make_press(spec["ratio"]), cache=make_cache(spec["nbits"]), max_new_tokens=8)
+                 press=make_press(spec["ratio"]), cache=make_cache(spec["nbits"], model.config), max_new_tokens=8)
         except Exception as e:
             print(f"[skip] {cond} failed on warm-up: {type(e).__name__}: {e}")
             continue
 
         for _, row in todo.iterrows():
             n_ctx = len(tok(row["context"]).input_ids)
-            press, cache = make_press(spec["ratio"]), make_cache(spec["nbits"])
+            press, cache = make_press(spec["ratio"]), make_cache(spec["nbits"], model.config)
             torch.cuda.synchronize()
             torch.cuda.reset_peak_memory_stats()
             t0 = time.perf_counter()
