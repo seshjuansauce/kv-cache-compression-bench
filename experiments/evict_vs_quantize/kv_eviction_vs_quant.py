@@ -382,9 +382,35 @@ def summarise(args):
         peak_mem_gb=("peak_mem_gb", "max"),
         n=("score", "size"),
     ).loc[order]
+    # Energy per correct answer: total joules / number of correct answers (scores are 0-100).
+    # It combines accuracy and cost in one number, so a cheap but wrong condition does not look good.
+    df["correct"] = df["score"] / 100.0
+    tot = df.groupby("condition")[["energy_j", "correct"]].sum().loc[order]
+    cost["j_per_correct"] = tot["energy_j"] / tot["correct"].where(tot["correct"] > 0)
     table = acc.round(1).join(cost.round(2))
     print(table.to_string())
     table.to_csv("summary.csv")
+
+    by_task = df.groupby(["condition", "task"])[["energy_j", "correct"]].sum()
+    jpc = (by_task["energy_j"] / by_task["correct"].where(by_task["correct"] > 0)).unstack("task").loc[order]
+    print("\nEnergy per correct answer (J), by task:")
+    print(jpc.round(1).to_string())
+    jpc.round(2).to_csv("energy_per_correct.csv")
+
+    # Equal-memory comparisons: eviction vs quantisation at (roughly) the same KV-cache size.
+    pairs = [("h2o_75", "kv_int4"), ("h2o_50+kv_int4", "kv_int2")]
+    rows = []
+    for a, b in pairs:
+        if a in cost.index and b in cost.index:
+            for cond in (a, b):
+                rows.append(dict(pair=f"{a} vs {b}", condition=cond, kv_ctx_mb=cost.loc[cond, "kv_ctx_mb"],
+                                 **{f"score_{t}": acc.loc[cond, t] for t in acc.columns},
+                                 energy_j=cost.loc[cond, "energy_j"], j_per_correct=cost.loc[cond, "j_per_correct"]))
+    if rows:
+        eq = pd.DataFrame(rows).round(1)
+        print("\nEqual-memory pairs:")
+        print(eq.to_string(index=False))
+        eq.to_csv("equal_memory_pairs.csv", index=False)
 
     import matplotlib.pyplot as plt
 
@@ -402,7 +428,7 @@ def summarise(args):
     axes[0].set_ylabel("Score (%)")
     fig.tight_layout()
     fig.savefig("accuracy_vs_kv.png", dpi=160)
-    print("\nWrote summary.csv and accuracy_vs_kv.png")
+    print("\nWrote summary.csv, energy_per_correct.csv, equal_memory_pairs.csv and accuracy_vs_kv.png")
 
 
 if __name__ == "__main__":
