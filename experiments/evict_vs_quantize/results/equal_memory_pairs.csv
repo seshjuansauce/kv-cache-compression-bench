@@ -1,0 +1,5 @@
+pair,condition,kv_ctx_mb,score_niah_single_1,score_qa_1,score_vt,energy_j,j_per_correct
+h2o_75 vs kv_int4,h2o_75,23.7,12.0,72.0,3.2,296.7,1020.9
+h2o_75 vs kv_int4,kv_int4,26.7,100.0,84.0,96.8,297.7,318.1
+h2o_50+kv_int4 vs kv_int2,h2o_50+kv_int4,13.4,20.0,72.0,18.4,302.9,823.1
+h2o_50+kv_int4 vs kv_int2,kv_int2,14.8,72.0,76.0,80.0,304.9,401.2
