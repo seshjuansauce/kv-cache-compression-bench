@@ -2,7 +2,7 @@
 
 For long inputs, how do **H2O-style KV-cache eviction** (dropping tokens) and **KV-cache quantisation** (storing them in fewer bits) compare, do they combine, and does the answer change by task? Costs are measured on the GPU (latency and energy), not estimated from FLOPs.
 
-> **Status:** full run complete (Kaggle T4, November 2026). Results are [below](#results), the summary files are in [`results/`](results), and [`analysis.ipynb`](analysis.ipynb) works through them.
+> **Status:** full run complete (Kaggle T4, November 2026). Results are [below](#results), the summary files are in [`results/`](results), and [`analysis.ipynb`](analysis.ipynb) works through them. The full write-up is the [technical report](../../report/Gupta_2026_KV_cache_evict_vs_quantise.pdf).
 
 ## Design
 
